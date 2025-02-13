@@ -1,167 +1,157 @@
-import math
 import os
 import csv
-from route_extracter import RouteExtractor, JSONLoader
-from route_plotter import RouteExtractor
-from targets_from_marzip import TargetsFromMarzip
+import json
+import math
+import re
+from route_extracter import RouteExtractor
+from file_input_manager import FileInputManager
 
-
-class RouteComparer(RouteExtractor):
+class RouteResultAnalyzer(RouteExtractor):
     """
-    SILS와 ISILS의 Safe Path와 Own Ship 데이터를 비교하여,
-    각 route의 waypoint 갯수, 각 waypoint마다의 거리 오차 (미터 단위)의 최대값(max error)과 합계(sum error),
-    그리고 Own Ship의 거리 차이를 계산하고 CSV 파일로 저장하는 클래스.
+    SILS와 ISILS 데이터를 분석하여, 각 파일별로
+    ca_path_gen_fail 플래그를 기준으로 "Success", "Fail", 또는 "NA"를 판정하는 클래스.
+    - 이벤트가 0개이면 결과는 "NA"
+    - 이벤트가 1개이면, 해당 이벤트의 플래그가 True이면 "NA", False이면 "Success"
+    - 이벤트가 여러 개이면, 모든 플래그가 False이면 "Success", 하나라도 True가 있으면 "Fail"
     """
     def __init__(self, sils_json_data, isils_json_data):
         super().__init__(sils_json_data, isils_json_data)
 
-    def haversine(self, lat1, lon1, lat2, lon2):
+    def analyze_dataset(self, events_info):
         """
-        두 좌표 간의 거리를 미터 단위로 계산하는 함수 (Haversine 공식)
+        events_info 리스트를 받아 ca_path_gen_fail 플래그에 기반해 결과를 도출합니다.
         """
-        R = 6371000  # 지구 반경 (미터)
-        phi1 = math.radians(lat1)
-        phi2 = math.radians(lat2)
-        dphi = math.radians(lat2 - lat1)
-        dlambda = math.radians(lon2 - lon1)
-        a = math.sin(dphi / 2)**2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2)**2
-        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-        return R * c
+        flags = [event.get("ca_path_gen_fail") for event in events_info if event.get("ca_path_gen_fail") is not None]
+        count = len(flags)
+        if count == 0:
+            return "NA"
+        elif count == 1:
+            return "NA" if flags[0] is True else "Success"
+        else:
+            return "Success" if all(flag is False for flag in flags) else "Fail"
 
-    def compare_routes(self):
+    def analyze(self, option="both"):
         """
-        각 route별로 SILS와 ISILS의 각 waypoint 간의 거리 차이를 계산하여,
-        waypoint 갯수, 최대 오차(max error) 및 오차 합계(sum error)를 리스트로 반환.
+        옵션에 따라 SILS, ISILS 또는 두 데이터를 분석합니다.
+        반환 예시:
+          {"SILS": "Success", "ISILS": "Fail"}
         """
-        results = []
-        # 두 safe_paths의 route 갯수는 같지 않을 수 있으므로, 최소 갯수만 비교
-        num_routes = min(len(self.sils_safe_paths), len(self.isils_safe_paths))
-        for i in range(num_routes):
-            route_sils = self.sils_safe_paths[i]
-            route_isils = self.isils_safe_paths[i]
-            n = min(len(route_sils), len(route_isils))
-            error_sum = 0.0
-            max_error = 0.0
-            for j in range(n):
-                lat1 = route_sils[j]["position"]["latitude"]
-                lon1 = route_sils[j]["position"]["longitude"]
-                lat2 = route_isils[j]["position"]["latitude"]
-                lon2 = route_isils[j]["position"]["longitude"]
-                d = self.haversine(lat1, lon1, lat2, lon2)
-                error_sum += d
-                if d > max_error:
-                    max_error = d
-            results.append({
-                "route_index": i,
-                "waypoint_count_sils": len(route_sils),
-                "waypoint_count_isils": len(route_isils),
-                "max_error_m": max_error,
-                "sum_error_m": error_sum
-            })
+        analysis = {}
+        if option in ("sils", "both"):
+            analysis["SILS"] = self.analyze_dataset(self.sils_events_info)
+        if option in ("isils", "both"):
+            analysis["ISILS"] = self.analyze_dataset(self.isils_events_info)
+        return analysis
+
+def write_csv(results, output_csv):
+    """
+    results: 리스트의 딕셔너리, 각 항목은 {"File": <파일명>, "Result": <결과>} 형태
+    output_csv: 저장할 CSV 파일 경로
+    """
+    fieldnames = ["File", "Result"]
+    with open(output_csv, mode="w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in results:
+            writer.writerow(row)
+
+class RouteAnalysisRunner:
+    """
+    SILS와 ISILS 파일들을 읽어 분석을 수행하고,
+    각각의 결과를 별도의 CSV 파일로 저장하는 클래스.
+    분석 옵션에 따라 SILS 또는 ISILS 또는 두 데이터를 분석합니다.
+    """
+    def __init__(self, sils_folder, isils_folder, options):
+        self.sils_folder = sils_folder
+        self.isils_folder = isils_folder
+        self.options = options
+        self.file_manager = FileInputManager(sils_folder=sils_folder, isils_folder=isils_folder)
+        
+        parent_dir = os.path.dirname(sils_folder)
+        folder_name = os.path.basename(parent_dir)
+        self.result_dir = os.path.join("analysis_result", folder_name)
+        if not os.path.exists(self.result_dir):
+            os.makedirs(self.result_dir)
+        # 분석 대상에 따라 결과 CSV 파일 생성
+        self.output_sils_csv = os.path.join(self.result_dir, "route_analysis_sils.csv")
+        self.output_isils_csv = os.path.join(self.result_dir, "route_analysis_isils.csv")
+
+    def add_summary_row(self, results):
+        """
+        결과 리스트에 요약 행을 추가합니다.
+        예: Success: 3, Fail: 2, NA: 1
+        """
+        count_success = sum(1 for r in results if r["Result"] == "Success")
+        count_fail = sum(1 for r in results if r["Result"] == "Fail")
+        count_na = sum(1 for r in results if r["Result"] == "NA")
+        summary_str = f"Success: {count_success}, Fail: {count_fail}, NA: {count_na}"
+        results.append({"File": "Summary", "Result": summary_str})
         return results
 
-    def compare_ownship(self):
+    def run(self):
         """
-        두 Own Ship 위치 간의 거리 차이를 미터 단위로 계산.
+        파일 목록을 자연 순서대로 처리하여 분석을 수행하고,
+        각각의 결과를 별도의 CSV 파일로 저장합니다.
         """
-        if self.sils_ship_position and self.isils_ship_position:
-            lat1 = self.sils_ship_position["latitude"]
-            lon1 = self.sils_ship_position["longitude"]
-            lat2 = self.isils_ship_position["latitude"]
-            lon2 = self.isils_ship_position["longitude"]
-            return self.haversine(lat1, lon1, lat2, lon2)
-        else:
-            return None
+        analyze_option = self.options["analyze"]
+        sils_files = sorted(
+            self.file_manager.get_sils_files(mode=self.options["sils_mode"]),
+            key=lambda f: FileInputManager.natural_sort_key(os.path.basename(f))
+        )
+        sils_results = []
+        isils_results = []
 
-    def write_csv(self, csv_filename):
-        """
-        비교 결과를 CSV 파일로 저장.
-        첫 부분은 각 route에 대한 비교 결과,
-        마지막 부분에 Own Ship 거리 차이를 기록.
-        """
-        route_results = self.compare_routes()
-        ownship_diff = self.compare_ownship()
-        with open(csv_filename, "w", newline="") as csvfile:
-            fieldnames = ["Route Index", "Waypoint Count SILS", "Waypoint Count ISILS", "Max Error (m)", "Sum Error (m)"]
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-            writer.writeheader()
-            for res in route_results:
-                writer.writerow({
-                    "Route Index": res["route_index"],
-                    "Waypoint Count SILS": res["waypoint_count_sils"],
-                    "Waypoint Count ISILS": res["waypoint_count_isils"],
-                    "Max Error (m)": res["max_error_m"],
-                    "Sum Error (m)": res["sum_error_m"]
-                })
-            # 빈 행 삽입
-            writer.writerow({})
-            writer.writerow({"Route Index": "Ownship Diff (m)", "Waypoint Count SILS": ownship_diff})
-        print(f"CSV 결과가 {csv_filename}에 저장되었습니다.")
-
-
-# --- 배치 처리 예제 (폴더 입력받아 처리) ---
-if __name__ == "__main__":
-    # marzip 파일들이 있는 폴더와 ISILS JSON 파일들이 있는 폴더 경로
-    marzip_folder = "scenarios_marzip/output"
-    isils_json_folder = "output/2025-02-10 04:56:56.934941"
-
-    # 결과 이미지를 저장할 폴더 생성 (없으면 생성)
-    result_dir = "result"
-    if not os.path.exists(result_dir):
-        os.makedirs(result_dir)
-
-    # CSV 결과 파일 경로
-    csv_output_file = os.path.join(result_dir, "comparison_results.csv")
-
-    # 배치 처리 결과들을 저장할 리스트 (각 파일의 비교 결과)
-    all_route_comparisons = []
-    all_ownship_diffs = []
-
-    # marzip_folder 내의 모든 .marzip 파일에 대해 처리
-    for filename in os.listdir(marzip_folder):
-        if filename.endswith(".marzip"):
-            marzip_file = os.path.join(marzip_folder, filename)
-            # marzip 파일의 base 이름 (예: "scen_301")
-            base_name = os.path.splitext(filename)[0]
-            # 대응하는 ISILS JSON 파일은 isils_json_folder 내에 base_name + ".json" 형태로 가정
-            isils_json_file = os.path.join(isils_json_folder, f"{base_name}.json")
-            if not os.path.exists(isils_json_file):
-                print(f"Warning: ISILS JSON 파일이 {marzip_file}에 대해 존재하지 않습니다.")
+        for sils_file in sils_files:
+            base_name = os.path.splitext(os.path.basename(sils_file))[0]
+            print(f"Processing {base_name} ...")
+            
+            # SILS 데이터 로드
+            sils_data = self.file_manager.load_sils_data(sils_file, mode=self.options["sils_mode"])
+            
+            # ISILS 파일 경로 구성 (같은 기본 이름)
+            isils_ext = ".marzip" if self.options["isils_mode"] == "marzip" else ".json"
+            isils_file = os.path.join(self.isils_folder, base_name + isils_ext)
+            isils_data = self.file_manager.load_isils_data(isils_file, mode=self.options["isils_mode"])
+            
+            if sils_data is None and isils_data is None:
+                print(f"{base_name}: 데이터 로드 실패, 스킵합니다.")
                 continue
+            
+            analyzer = RouteResultAnalyzer(sils_json_data=sils_data, isils_json_data=isils_data)
+            # 실제 분석은 옵션에 맞게 수행
+            analysis = analyzer.analyze(option=analyze_option)
+            
+            if analyze_option in ("sils", "both"):
+                sils_result = analysis.get("SILS", "N/A")
+                sils_results.append({"File": base_name, "Result": sils_result})
+            if analyze_option in ("isils", "both"):
+                isils_result = analysis.get("ISILS", "N/A")
+                isils_results.append({"File": base_name, "Result": isils_result})
+        
+        # 결과 CSV 파일 생성: 옵션에 따라 해당 결과만 저장하고, 마지막에 요약 행 추가
+        if analyze_option in ("sils", "both") and sils_results:
+            sils_results = self.add_summary_row(sils_results)
+            write_csv(sils_results, self.output_sils_csv)
+            print(f"SILS 분석 결과가 {self.output_sils_csv}에 저장되었습니다.")
+        if analyze_option in ("isils", "both") and isils_results:
+            isils_results = self.add_summary_row(isils_results)
+            write_csv(isils_results, self.output_isils_csv)
+            print(f"ISILS 분석 결과가 {self.output_isils_csv}에 저장되었습니다.")
 
-            # marzip 파일 처리
-            marzip_data = TargetsFromMarzip(marzip_file).extract_and_read_marzip()
-            sils_json_data = marzip_data["simulation_result"]
-            isils_json_data = JSONLoader(json_file=isils_json_file).load()
-
-            # 비교 결과 계산 (RouteComparer 용 데이터 준비)
-            comparer = RouteComparer(sils_json_data, isils_json_data)
-            # 여기서 compare_routes()를 호출하여 route_results를 구함
-            route_results = comparer.compare_routes()
-            ownship_diff = comparer.compare_ownship()
-
-            # 각 marzip 파일에 대한 결과에 base_name 추가
-            for res in route_results:
-                res["base_name"] = base_name
-            all_route_comparisons.extend(route_results)
-            all_ownship_diffs.append({"base_name": base_name, "ownship_diff_m": ownship_diff})
-
-    # CSV 파일 생성: 경로 비교 결과와 Own Ship 차이 결과를 하나의 CSV에 기록
-    with open(csv_output_file, "w", newline="") as csvfile:
-        fieldnames = ["base_name", "Route Index", "Waypoint Count SILS", "Waypoint Count ISILS", "Max Error (m)", "Sum Error (m)", "Ownship Diff (m)"]
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        writer.writeheader()
-        # 각 route 비교 결과에 해당 marzip 파일의 ownship diff를 추가 (같은 base_name)
-        for res in all_route_comparisons:
-            own_diff = next((item["ownship_diff_m"] for item in all_ownship_diffs if item["base_name"] == res["base_name"]), None)
-            row = {
-                "base_name": res["base_name"],
-                "Route Index": res["route_index"],
-                "Waypoint Count SILS": res["waypoint_count_sils"],
-                "Waypoint Count ISILS": res["waypoint_count_isils"],
-                "Max Error (m)": res["max_error_m"],
-                "Sum Error (m)": res["sum_error_m"],
-                "Ownship Diff (m)": own_diff
-            }
-            writer.writerow(row)
-    print(f"CSV 결과가 {csv_output_file}에 저장되었습니다.")
+if __name__ == "__main__":
+    # 폴더 경로 설정 (직접 입력)
+    sils_folder = "sils_results/ver013_20250213_6_20250213T104604/output"  # SILS 파일들이 위치한 폴더
+    isils_folder = "output/2025-02-10 04:56:56.934941"                      # ISILS 파일들이 위치한 폴더
+    
+    # 옵션 설정
+    # "analyze": 분석 대상 ("both", "sils", "isils")
+    # "sils_mode": SILS 데이터 로드 방식 ("marzip" 또는 "json"), None이면 로드 안 함
+    # "isils_mode": ISILS 데이터 로드 방식 ("marzip" 또는 "json"), None이면 로드 안 함
+    options = {
+        "analyze": "sils",   # 여기서 "sils"로 설정하면 SILS 데이터만 분석합니다.
+        "sils_mode": "marzip",
+        "isils_mode": None
+    }
+    
+    runner = RouteAnalysisRunner(sils_folder, isils_folder, options)
+    runner.run()
