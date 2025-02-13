@@ -15,32 +15,28 @@ def safe_get(data, keys, default=None):
 
 class RouteExtractor:
     """
-    SILS와 ISILS JSON 데이터에서 Safe Route, Base Route, Own Ship, Target Ships 정보를 추출하는 클래스.
+    SILS와 ISILS JSON 데이터에서 Base Route, Own Ship의 정적 정보,
+    그리고 이벤트 관련 정보를 통합하여 추출하는 클래스입니다.
+    
+    이벤트 관련 정보는 각 이벤트에서 아래 데이터를 추출합니다.
+      - safe_route:  cagaData → eventData → safe_path_info → route
+      - target_ships:  cagaData → eventData → timeSeriesData → targetShips (리스트 평탄화 적용)
+      - own_ship_event:  cagaData → eventData → timeSeriesData → ownShip
+      - ca_path_gen_fail:  cagaData → eventData → caPathGenFail
+      - is_near_target:  cagaData → eventData → isNearTarget
     """
     def __init__(self, sils_json_data, isils_json_data):
         self.base_route = self.extract_base_route(sils_json_data)
-        self.sils_safe_paths = self.extract_safe_path_at_event(sils_json_data)
-        self.isils_safe_paths = self.extract_safe_path_at_event(isils_json_data)
-        self.sils_target_ships_event_info = self.extract_target_ships_event_info(sils_json_data)
-        self.isils_target_ships_event_info = self.extract_target_ships_event_info(isils_json_data)
-        self.sils_own_ship_event_info = self.extract_own_ship_event_info(sils_json_data)
-        self.isils_own_ship_event_info = self.extract_own_ship_event_info(isils_json_data)
-
-        self.sils_own_ship_info = self.extract_own_ship_static_info(sils_json_data)
-        self.isils_own_ship_info = self.extract_own_ship_static_info(isils_json_data)
-
-        self.sils_event_data = self.extract_event_data(sils_json_data)
-        self.is_path_gen_fail_sils, self.is_near_target_sils = self.extract_extract_evaluate_data(sils_json_data)
-
-        self.isils_event_data = self.extract_event_data(isils_json_data)
-        self.is_path_gen_fail_isils, self.is_near_target_isils = self.extract_extract_evaluate_data(isils_json_data)
-
-
-
+        self.own_ship_static_sils = self.extract_own_ship_static_info(sils_json_data)
+        self.own_ship_static_isils = self.extract_own_ship_static_info(isils_json_data)
+        
+        # 이벤트 정보를 통합 추출
+        self.sils_events_info = self.extract_events_info(sils_json_data)
+        self.isils_events_info = self.extract_events_info(isils_json_data)
 
     def flatten(self, item):
         """
-        재귀적으로 리스트를 평탄화하여 모든 중첩을 풀어준다.
+        재귀적으로 리스트를 평탄화하여 모든 중첩을 풀어줍니다.
         예: [[a, b], c, [d, [e, f]]] => [a, b, c, d, e, f]
         """
         if isinstance(item, list):
@@ -51,78 +47,38 @@ class RouteExtractor:
         else:
             return [item]
 
-    def extract_safe_path_at_event(self, data):
-        """
-        Safe Route 추출 (cagaData → eventData → safe_path_info → route)
-        여러 eventData가 있을 경우, 각 이벤트의 safe_path_info의 route를 리스트에 담아 반환.
-        반환 예: [ route_event0, route_event1, ... ]
-        """
-        event_data = safe_get(data, ["cagaData", "eventData"], default=[])
-        routes = []
-        if isinstance(event_data, list):
-            for event in event_data:
-                route = safe_get(event, ["safe_path_info", "route"])
-                if route is not None:
-                    routes.append(route)
-        return routes
-
-    def extract_target_ships_event_info(self, data):
-        """
-        Target Ships 추출.
-        각 event의 targetShips 데이터를 추출하여 리스트에 담아 반환.
-        반환 예: [ targets_event0, targets_event1, ... ]
-        """
-        event_data = safe_get(data, ["cagaData", "eventData"], default=[])
-        targets = []
-        if isinstance(event_data, list):
-            for event in event_data:
-                tships = safe_get(event, ["timeSeriesData", "targetShips"], default=[])
-                # 만약 tships가 리스트가 아니라면 리스트로 변환
-                if not isinstance(tships, list):
-                    tships = [tships]
-                tships = self.flatten(tships)
-                targets.append(tships)
-        return targets
-
     def extract_base_route(self, data):
         """
         Base Route 추출 (trafficSituation → ownShip → waypoints)
         """
         return safe_get(data, ["trafficSituation", "ownShip", "waypoints"], default=[])
 
-    def extract_own_ship_event_info(self, data):
-        """
-        Own Ship 정보 추출 (cagaData → eventData → timeSeriesData → ownShip)
-        여러 eventData가 있을 경우, 각 이벤트의 timeSeriesData의 ownShip 정보를 리스트에 담아 반환.
-        반환 예: [ ownShip_event0, ownShip_event1, ... ]
-        """
-        event_data = safe_get(data, ["cagaData", "eventData"], default=[])
-        own_ships = []
-        if isinstance(event_data, list):
-            for event in event_data:
-                own_ship = safe_get(event, ["timeSeriesData", "ownShip"])
-                if own_ship is not None:
-                    own_ships.append(own_ship)
-        return own_ships
-    
     def extract_own_ship_static_info(self, data):
+        """
+        Own Ship의 정적(static) 정보 추출 (trafficSituation → ownShip → static)
+        """
         return safe_get(data, ["trafficSituation", "ownShip", "static"], default={})
-    
-    def extract_event_data(self, data):
-        return safe_get(data, ["cagaData", "eventData"], default=[])
-    
 
-    def extract_extract_evaluate_data(self, data):
+    def extract_events_info(self, data):
+        """
+        이벤트 정보를 통합하여 추출합니다.
+        각 이벤트에서 아래 데이터를 딕셔너리 형태로 추출하여 리스트로 반환합니다.
+        """
+        events = []
         event_data = safe_get(data, ["cagaData", "eventData"], default=[])
-        path_gens = []
-        near_targets = []
-
         if isinstance(event_data, list):
             for event in event_data:
-                path_gen = safe_get(event, ["caPathGenFail"])
-                near_target = safe_get(event, ["isNearTarget"])
-                if path_gen is not None and near_target is not None:
-                    path_gens.append(path_gen)
-                    near_targets.append(near_target)
-
-        return path_gens, near_targets
+                event_info = {}
+                event_info["safe_route"] = safe_get(event, ["safe_path_info", "route"])
+                
+                # targetShips: 리스트가 아닐 경우 리스트로 변환 후 평탄화 적용
+                target_ships = safe_get(event, ["timeSeriesData", "targetShips"], default=[])
+                if not isinstance(target_ships, list):
+                    target_ships = [target_ships]
+                event_info["target_ships"] = self.flatten(target_ships)
+                
+                event_info["own_ship_event"] = safe_get(event, ["timeSeriesData", "ownShip"])
+                event_info["ca_path_gen_fail"] = safe_get(event, ["caPathGenFail"])
+                event_info["is_near_target"] = safe_get(event, ["isNearTarget"])
+                events.append(event_info)
+        return events
